@@ -2,7 +2,7 @@
 Targets router — CRUD for monitored domains.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, field_validator
 from firebase_admin import firestore
 from google.cloud.firestore_v1 import FieldFilter
@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from auth import get_current_user
+from scanner.engine import run_scan
 
 router = APIRouter(prefix="/targets", tags=["targets"])
 
@@ -50,8 +51,12 @@ async def list_targets(user: dict = Depends(get_current_user)):
 
 
 @router.post("", status_code=201)
-async def create_target(body: TargetCreate, user: dict = Depends(get_current_user)):
-    """Add a new target domain."""
+async def create_target(
+    body: TargetCreate,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Add a new target domain and trigger a scan in the background automatically."""
     db = firestore.client()
     uid = user["uid"]
 
@@ -71,7 +76,22 @@ async def create_target(body: TargetCreate, user: dict = Depends(get_current_use
         "created_at": firestore.SERVER_TIMESTAMP,
     })
 
-    return {"id": doc_ref.id, "root_domain": body.root_domain}
+    # Auto-create a scan document
+    scan_ref = db.collection("users").document(uid).collection("scans").document()
+    scan_ref.set({
+        "target_id": doc_ref.id,
+        "root_domain": body.root_domain,
+        "status": "queued",
+        "started_at": firestore.SERVER_TIMESTAMP,
+        "completed_at": None,
+        "assets_found": 0,
+        "findings_found": 0,
+    })
+
+    # Trigger background scan execution automatically
+    background_tasks.add_task(run_scan, uid, scan_ref.id, body.root_domain)
+
+    return {"id": doc_ref.id, "root_domain": body.root_domain, "scan_id": scan_ref.id}
 
 
 @router.delete("/{target_id}")
